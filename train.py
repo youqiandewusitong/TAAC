@@ -135,14 +135,28 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
+    parser.add_argument('--loss_type', type=str, default='bce',
+                        choices=['bce', 'focal', 'dice', 'bce_smooth'],
+                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
+                             'dice = Dice Loss, bce_smooth = BCE with Label Smoothing')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--dice_smooth', type=float, default=1.0,
+                        help='Dice Loss smoothing constant '
+                             '(effective only when --loss_type=dice)')
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help='Label smoothing factor for bce_smooth '
+                             '(effective only when --loss_type=bce_smooth)')
+
+    # AMP mixed precision training.
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Enable automatic mixed precision training (default on)')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                        help='Disable automatic mixed precision training')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -340,6 +354,8 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        dice_smooth=args.dice_smooth,
+        label_smoothing=args.label_smoothing,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
@@ -350,6 +366,7 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.use_amp,
     )
 
     trainer.train()

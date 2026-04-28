@@ -286,3 +286,46 @@ def sigmoid_focal_loss(
     elif reduction == 'sum':
         return loss.sum()
     return loss
+
+
+def dice_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1.0,
+    reduction: str = 'mean',
+) -> torch.Tensor:
+    """Dice Loss for binary classification (robust to class imbalance).
+
+    Args:
+        logits: (N,) raw logits (before sigmoid).
+        targets: (N,) binary labels {0, 1}.
+        smooth: smoothing constant to avoid division by zero.
+        reduction: 'mean' | 'sum' | 'none'.
+    """
+    probs = torch.sigmoid(logits)
+    intersection = (probs * targets).sum()
+    dice = (2. * intersection + smooth) / (probs.sum() + targets.sum() + smooth)
+    loss = 1 - dice
+    if reduction == 'mean':
+        return loss
+    elif reduction == 'sum':
+        return loss * logits.numel()
+    return loss.expand_as(logits)
+
+
+def label_smoothing_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    smoothing: float = 0.1,
+    reduction: str = 'mean',
+) -> torch.Tensor:
+    """BCE with Label Smoothing (prevents overconfidence).
+
+    Args:
+        logits: (N,) raw logits (before sigmoid).
+        targets: (N,) binary labels {0, 1}.
+        smoothing: label smoothing factor in [0, 1). 0 = no smoothing.
+        reduction: 'mean' | 'sum' | 'none'.
+    """
+    targets_smooth = targets * (1 - smoothing) + 0.5 * smoothing
+    return F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction=reduction)

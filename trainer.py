@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, dice_loss, label_smoothing_bce, EarlyStopping
 from model import ModelInput
 
 
@@ -48,6 +48,8 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        dice_smooth: float = 1.0,
+        label_smoothing: float = 0.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -58,6 +60,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = True,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -100,6 +103,8 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.dice_smooth: float = dice_smooth
+        self.label_smoothing: float = label_smoothing
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -107,10 +112,13 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.use_amp: bool = use_amp
+        self.scaler: Optional[torch.cuda.amp.GradScaler] = torch.cuda.amp.GradScaler() if use_amp else None
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"use_amp={use_amp}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -408,22 +416,44 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.zero_grad()
 
-        model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                model_input = self._make_model_input(device_batch)
+                logits = self.model(model_input).squeeze(-1)
+                if self.loss_type == 'focal':
+                    loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                elif self.loss_type == 'dice':
+                    loss = dice_loss(logits, label, smooth=self.dice_smooth)
+                elif self.loss_type == 'bce_smooth':
+                    loss = label_smoothing_bce(logits, label, smoothing=self.label_smoothing)
+                else:
+                    loss = F.binary_cross_entropy_with_logits(logits, label)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.unscale_(self.sparse_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.step(self.sparse_optimizer)
+            self.scaler.update()
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
-
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+            model_input = self._make_model_input(device_batch)
+            logits = self.model(model_input).squeeze(-1)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            elif self.loss_type == 'dice':
+                loss = dice_loss(logits, label, smooth=self.dice_smooth)
+            elif self.loss_type == 'bce_smooth':
+                loss = label_smoothing_bce(logits, label, smoothing=self.label_smoothing)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
