@@ -21,6 +21,7 @@ from sklearn.metrics import roc_auc_score
 from utils import sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
 from muon import Muon
+from losses import HybridLoss
 
 
 class PCVRHyFormerRankingTrainer:
@@ -59,6 +60,9 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_infonce: bool = False,
+        infonce_weight: float = 0.5,
+        infonce_temperature: float = 0.07,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -108,11 +112,27 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.use_infonce: bool = use_infonce
+
+        # Initialize loss function
+        if use_infonce:
+            self.loss_fn = HybridLoss(
+                bce_weight=1.0,
+                infonce_weight=infonce_weight,
+                use_focal=(loss_type == 'focal'),
+                focal_alpha=focal_alpha,
+                focal_gamma=focal_gamma,
+                temperature=infonce_temperature,
+            )
+            logging.info(f"Using HybridLoss: InfoNCE (weight={infonce_weight}, temp={infonce_temperature}) + {loss_type.upper()}")
+        else:
+            self.loss_fn = None
+            logging.info(f"Using standard {loss_type.upper()} loss")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"optimizer=Muon+AdamW")
+                     f"optimizer=Muon+AdamW, use_infonce={use_infonce}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -411,16 +431,22 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        if self.use_infonce:
+            # Get both logits and embeddings for InfoNCE
+            logits, embeddings = self.model.predict(model_input)
+            logits = logits.squeeze(-1)
+            loss, loss_dict = self.loss_fn(logits, embeddings, label)
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            # Standard forward pass
+            logits = self.model(model_input)
+            logits = logits.squeeze(-1)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
         loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
         self.dense_optimizer.step()
