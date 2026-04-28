@@ -20,7 +20,6 @@ from sklearn.metrics import roc_auc_score
 
 from utils import sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
-from muon import Muon
 from losses import HybridLoss
 
 
@@ -63,6 +62,7 @@ class PCVRHyFormerRankingTrainer:
         use_infonce: bool = False,
         infonce_weight: float = 0.5,
         infonce_temperature: float = 0.07,
+        use_amp: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -77,25 +77,25 @@ class PCVRHyFormerRankingTrainer:
         # do not ship ns_groups.json separately.
         self.ns_groups_path: Optional[str] = ns_groups_path
 
-        # Hybrid optimizer: AdamW for sparse Embeddings, Muon for dense weights.
+        # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
-            logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (AdamW lr={sparse_lr})")
-            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (Muon lr={lr})")
-            self.sparse_optimizer = torch.optim.AdamW(
+            logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
+            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
+            self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
-            self.dense_optimizer: torch.optim.Optimizer = Muon(
-                dense_params, lr=lr, momentum=0.9, ns_steps=5
+            self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+                dense_params, lr=lr, betas=(0.9, 0.98)
             )
         else:
             self.sparse_optimizer = None
-            self.dense_optimizer = Muon(
-                model.parameters(), lr=lr, momentum=0.9, ns_steps=5
+            self.dense_optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
 
         self.num_epochs: int = num_epochs
@@ -113,6 +113,14 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.use_infonce: bool = use_infonce
+        self.use_amp: bool = use_amp
+
+        # AMP scaler for bfloat16
+        if use_amp:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
+            logging.info("AMP enabled with bfloat16 precision")
+        else:
+            self.scaler = None
 
         # Initialize loss function
         if use_infonce:
@@ -132,7 +140,7 @@ class PCVRHyFormerRankingTrainer:
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"optimizer=Muon+AdamW, use_infonce={use_infonce}")
+                     f"optimizer=Adagrad+AdamW, use_infonce={use_infonce}, use_amp={use_amp}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -385,7 +393,7 @@ class PCVRHyFormerRankingTrainer:
 
                 reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
                 sparse_params = self.model.get_sparse_params()
-                self.sparse_optimizer = torch.optim.AdamW(
+                self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
                 # Restore optimizer state for low-cardinality embeddings only.
@@ -394,7 +402,7 @@ class PCVRHyFormerRankingTrainer:
                     if p.data_ptr() not in reinit_ptrs and p.data_ptr() in old_state:
                         self.sparse_optimizer.state[p] = old_state[p.data_ptr()]
                         restored += 1
-                logging.info(f"Rebuilt AdamW optimizer after epoch {epoch}, "
+                logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
@@ -432,26 +440,39 @@ class PCVRHyFormerRankingTrainer:
 
         model_input = self._make_model_input(device_batch)
 
-        if self.use_infonce:
-            # Get both logits and embeddings for InfoNCE
-            logits, embeddings = self.model.predict(model_input)
-            logits = logits.squeeze(-1)
-            loss, loss_dict = self.loss_fn(logits, embeddings, label)
-        else:
-            # Standard forward pass
-            logits = self.model(model_input)
-            logits = logits.squeeze(-1)
-            if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        # AMP forward pass
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=torch.bfloat16):
+            if self.use_infonce:
+                # Get both logits and embeddings for InfoNCE
+                logits, embeddings = self.model.predict(model_input)
+                logits = logits.squeeze(-1)
+                loss, loss_dict = self.loss_fn(logits, embeddings, label)
             else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+                # Standard forward pass
+                logits = self.model(model_input)
+                logits = logits.squeeze(-1)
+                if self.loss_type == 'focal':
+                    loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                else:
+                    loss = F.binary_cross_entropy_with_logits(logits, label)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
-
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+        # AMP backward pass
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.unscale_(self.sparse_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.step(self.sparse_optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 

@@ -202,6 +202,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--infonce_temperature', type=float, default=0.07,
                         help='Temperature parameter for InfoNCE loss (effective only when --use_infonce)')
 
+    # AMP parameters
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Enable Automatic Mixed Precision training with bfloat16')
+
     args = parser.parse_args()
 
     # Environment variables take precedence.
@@ -361,6 +365,7 @@ def main() -> None:
         use_infonce=args.use_infonce,
         infonce_weight=args.infonce_weight,
         infonce_temperature=args.infonce_temperature,
+        use_amp=args.use_amp,
     )
 
     trainer.train()
