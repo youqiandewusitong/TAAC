@@ -202,9 +202,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--infonce_temperature', type=float, default=0.07,
                         help='Temperature parameter for InfoNCE loss (effective only when --use_infonce)')
 
-    # AMP parameters
     parser.add_argument('--use_amp', action='store_true', default=False,
                         help='Enable Automatic Mixed Precision training with bfloat16')
+
+    # Feature engineering (online, leakage-safe sample-level features)
+    parser.add_argument('--enable_feature_engineering', action='store_true', default=False,
+                        help='Enable online engineered dense features in dataset pipeline')
+    parser.add_argument('--fe_time', action='store_true', default=True,
+                        help='Enable time-derived engineered features (effective only when feature engineering is enabled)')
+    parser.add_argument('--no_fe_time', dest='fe_time', action='store_false',
+                        help='Disable time-derived engineered features')
+    parser.add_argument('--fe_seq_stats', action='store_true', default=True,
+                        help='Enable sequence-stat engineered features (effective only when feature engineering is enabled)')
+    parser.add_argument('--no_fe_seq_stats', dest='fe_seq_stats', action='store_false',
+                        help='Disable sequence-stat engineered features')
+    parser.add_argument('--fe_cross_dense', action='store_true', default=True,
+                        help='Enable cross/intensity engineered features (effective only when feature engineering is enabled)')
+    parser.add_argument('--no_fe_cross_dense', dest='fe_cross_dense', action='store_false',
+                        help='Disable cross/intensity engineered features')
 
     args = parser.parse_args()
 
@@ -261,6 +276,10 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        enable_feature_engineering=args.enable_feature_engineering,
+        fe_time=args.fe_time,
+        fe_seq_stats=args.fe_seq_stats,
+        fe_cross_dense=args.fe_cross_dense,
     )
 
     # ---- NS groups ----
@@ -288,7 +307,7 @@ def main() -> None:
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
-        "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
+        "user_dense_dim": pcvr_dataset.effective_user_dense_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,

@@ -153,6 +153,10 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        enable_feature_engineering: bool = False,
+        fe_time: bool = True,
+        fe_seq_stats: bool = True,
+        fe_cross_dense: bool = True,
     ) -> None:
         """
         Args:
@@ -170,6 +174,11 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            enable_feature_engineering: whether to append leakage-safe
+                engineered dense features computed from current sample fields.
+            fe_time: toggle time-derived engineered features.
+            fe_seq_stats: toggle sequence-stat engineered features.
+            fe_cross_dense: toggle cross/intensity engineered features.
         """
         super().__init__()
 
@@ -188,6 +197,13 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.enable_feature_engineering = enable_feature_engineering
+        self.fe_time = fe_time
+        self.fe_seq_stats = fe_seq_stats
+        self.fe_cross_dense = fe_cross_dense
+        # Computed after schema load; consumed by train.py when building model.
+        self.engineered_dense_dim: int = 0
+        self.effective_user_dense_dim: int = 0
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -207,6 +223,11 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        self.engineered_dense_dim = self._compute_engineered_dense_dim()
+        self.effective_user_dense_dim = (
+            self.user_dense_schema.total_dim + self.engineered_dense_dim
+        )
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -268,6 +289,100 @@ class PCVRParquetDataset(IterableDataset):
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
             f"buffer_batches={buffer_batches}, shuffle={shuffle}")
+
+    def _compute_engineered_dense_dim(self) -> int:
+        if not self.enable_feature_engineering:
+            return 0
+        dim = 0
+        if self.fe_time:
+            # hour_sin/hour_cos, dow_sin/dow_cos, is_weekend
+            dim += 5
+        if self.fe_seq_stats:
+            # per-domain: len_norm, nonzero_ratio, bucket_mean, bucket_min, bucket_max
+            dim += 5 * len(self.seq_domains)
+        if self.fe_cross_dense:
+            # total_seq_len, per-domain len_ratio, dense_l2_norm, dense_mean, dense_std
+            dim += 1 + len(self.seq_domains) + 3
+        return dim
+
+    def _build_engineered_dense(
+        self,
+        timestamps: "npt.NDArray[np.int64]",
+        user_dense: "npt.NDArray[np.float32]",
+        seq_lens_map: Dict[str, "npt.NDArray[np.int64]"],
+        time_bucket_map: Dict[str, "npt.NDArray[np.int64]"],
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        if self.engineered_dense_dim <= 0:
+            return np.zeros((B, 0), dtype=np.float32)
+
+        feats: List["npt.NDArray[np.float32]"] = []
+        eps = 1e-6
+
+        if self.fe_time:
+            dt_hours = ((timestamps // 3600) % 24).astype(np.float32)
+            dt_dow = ((timestamps // 86400 + 4) % 7).astype(np.float32)
+            hour_angle = (2.0 * np.pi * dt_hours) / 24.0
+            dow_angle = (2.0 * np.pi * dt_dow) / 7.0
+            hour_sin = np.sin(hour_angle).astype(np.float32).reshape(B, 1)
+            hour_cos = np.cos(hour_angle).astype(np.float32).reshape(B, 1)
+            dow_sin = np.sin(dow_angle).astype(np.float32).reshape(B, 1)
+            dow_cos = np.cos(dow_angle).astype(np.float32).reshape(B, 1)
+            is_weekend = (dt_dow >= 5).astype(np.float32).reshape(B, 1)
+            feats.extend([hour_sin, hour_cos, dow_sin, dow_cos, is_weekend])
+
+        total_seq_len = np.zeros(B, dtype=np.float32)
+        if self.fe_seq_stats:
+            for domain in self.seq_domains:
+                lens = seq_lens_map[domain].astype(np.float32)
+                max_len = float(self._seq_maxlen[domain])
+                len_norm = (lens / max(max_len, 1.0)).reshape(B, 1)
+                nonzero_ratio = len_norm.copy()
+
+                tb = time_bucket_map[domain].astype(np.float32)
+                mask = (tb > 0).astype(np.float32)
+                count = np.maximum(mask.sum(axis=1), 1.0)
+                tb_sum = (tb * mask).sum(axis=1)
+                tb_mean = (tb_sum / count).reshape(B, 1)
+
+                tb_with_big = np.where(mask > 0, tb, 1e9)
+                tb_min = tb_with_big.min(axis=1)
+                tb_min[tb_min > 1e8] = 0.0
+                tb_min = tb_min.reshape(B, 1).astype(np.float32)
+
+                tb_max = (tb * mask).max(axis=1).reshape(B, 1).astype(np.float32)
+
+                feats.extend([len_norm.astype(np.float32),
+                              nonzero_ratio.astype(np.float32),
+                              tb_mean.astype(np.float32),
+                              tb_min,
+                              tb_max])
+                total_seq_len += lens
+
+        if self.fe_cross_dense:
+            total_seq_len_col = total_seq_len.reshape(B, 1)
+            feats.append(total_seq_len_col.astype(np.float32))
+
+            denom = np.maximum(total_seq_len, eps)
+            for domain in self.seq_domains:
+                lens = seq_lens_map[domain].astype(np.float32)
+                ratio = (lens / denom).reshape(B, 1).astype(np.float32)
+                feats.append(ratio)
+
+            if user_dense.shape[1] > 0:
+                dense_l2 = np.linalg.norm(user_dense, axis=1).reshape(B, 1).astype(np.float32)
+                dense_mean = user_dense.mean(axis=1).reshape(B, 1).astype(np.float32)
+                dense_std = user_dense.std(axis=1).reshape(B, 1).astype(np.float32)
+            else:
+                dense_l2 = np.zeros((B, 1), dtype=np.float32)
+                dense_mean = np.zeros((B, 1), dtype=np.float32)
+                dense_std = np.zeros((B, 1), dtype=np.float32)
+
+            feats.extend([dense_l2, dense_mean, dense_std])
+
+        if not feats:
+            return np.zeros((B, 0), dtype=np.float32)
+        return np.concatenate(feats, axis=1).astype(np.float32)
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -581,6 +696,9 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        seq_lens_map: Dict[str, "npt.NDArray[np.int64]"] = {}
+        time_bucket_map: Dict[str, "npt.NDArray[np.int64]"] = {}
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
@@ -626,6 +744,7 @@ class PCVRParquetDataset(IterableDataset):
 
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
+            seq_lens_map[domain] = lengths.copy()
 
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
@@ -665,6 +784,18 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            time_bucket_map[domain] = time_bucket.copy()
+
+        if self.engineered_dense_dim > 0:
+            engineered_dense = self._build_engineered_dense(
+                timestamps=timestamps,
+                user_dense=user_dense,
+                seq_lens_map=seq_lens_map,
+                time_bucket_map=time_bucket_map,
+                B=B,
+            )
+            dense_concat = np.concatenate([user_dense, engineered_dense], axis=1).astype(np.float32)
+            result['user_dense_feats'] = torch.from_numpy(dense_concat)
 
         return result
 
@@ -681,6 +812,10 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    enable_feature_engineering: bool = False,
+    fe_time: bool = True,
+    fe_seq_stats: bool = True,
+    fe_cross_dense: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +864,10 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        enable_feature_engineering=enable_feature_engineering,
+        fe_time=fe_time,
+        fe_seq_stats=fe_seq_stats,
+        fe_cross_dense=fe_cross_dense,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -751,6 +890,10 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        enable_feature_engineering=enable_feature_engineering,
+        fe_time=fe_time,
+        fe_seq_stats=fe_seq_stats,
+        fe_cross_dense=fe_cross_dense,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
