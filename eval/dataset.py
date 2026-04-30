@@ -215,8 +215,9 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- Pre-allocate numpy buffers ----
         B = batch_size
-        self._num_time_features = 15
-        self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim + self._num_time_features), dtype=np.int64)
+        # Add space for time features: 7 features (year, month, day, hour, minute, weekday, is_weekend)
+        self._num_time_features = 7
+        self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
@@ -283,10 +284,13 @@ class PCVRParquetDataset(IterableDataset):
             self.user_int_schema.add(fid, dim)
             self.user_int_vocab_sizes.extend([vs] * dim)
 
-        # Add time features to schema
-        time_feature_vocab_sizes_full = [101, 13, 32, 24, 60, 7, 2, 101, 13, 32, 24, 60, 7, 2, 5]
-        for i, vs in enumerate(time_feature_vocab_sizes_full):
-            fid = 10000 + i
+        # Add time features to schema (will be appended at the end)
+        # Time feature vocab sizes: year(101), month(13), day(32), hour(24), minute(60), weekday(7), is_weekend(2)
+        # Only use timestamp features (7 total) - do NOT use label_time to avoid data leakage
+        time_feature_vocab_sizes = [101, 13, 32, 24, 60, 7, 2]
+
+        for i, vs in enumerate(time_feature_vocab_sizes):
+            fid = 10000 + i  # Use high fid to avoid collision
             self.user_int_schema.add(fid, 1)
             self.user_int_vocab_sizes.append(vs)
 
@@ -511,32 +515,45 @@ class PCVRParquetDataset(IterableDataset):
         return padded
 
     def _extract_time_features(self, timestamps: np.ndarray) -> np.ndarray:
-        """Extract time features from Unix timestamps (UTC)."""
+        """Extract time features from Unix timestamps (UTC).
+
+        Returns array of shape (B, 7) with features:
+        [year, month, day, hour, minute, weekday, is_weekend]
+        All values are clipped to safe ranges to prevent index errors.
+        """
         from datetime import datetime, timezone
+
         B = len(timestamps)
         time_feats = np.zeros((B, 7), dtype=np.int64)
+
         for i in range(B):
             ts = int(timestamps[i])
             if ts <= 0:
+                # Invalid timestamp: use default values (all zeros will be treated as padding)
                 continue
+
             try:
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                time_feats[i, 0] = dt.year - 2000
-                time_feats[i, 1] = dt.month
-                time_feats[i, 2] = dt.day
-                time_feats[i, 3] = dt.hour
-                time_feats[i, 4] = dt.minute
-                time_feats[i, 5] = dt.weekday()
-                time_feats[i, 6] = 1 if dt.weekday() >= 5 else 0
+                time_feats[i, 0] = dt.year - 2000  # Year offset from 2000 (e.g., 2024 -> 24)
+                time_feats[i, 1] = dt.month         # 1-12
+                time_feats[i, 2] = dt.day           # 1-31
+                time_feats[i, 3] = dt.hour          # 0-23
+                time_feats[i, 4] = dt.minute        # 0-59
+                time_feats[i, 5] = dt.weekday()     # 0-6 (Monday=0)
+                time_feats[i, 6] = 1 if dt.weekday() >= 5 else 0  # is_weekend
             except (ValueError, OSError, OverflowError):
+                # Invalid timestamp: keep zeros
                 pass
-        time_feats[:, 0] = np.clip(time_feats[:, 0], 0, 100)
-        time_feats[:, 1] = np.clip(time_feats[:, 1], 0, 12)
-        time_feats[:, 2] = np.clip(time_feats[:, 2], 0, 31)
-        time_feats[:, 3] = np.clip(time_feats[:, 3], 0, 23)
-        time_feats[:, 4] = np.clip(time_feats[:, 4], 0, 59)
-        time_feats[:, 5] = np.clip(time_feats[:, 5], 0, 6)
-        time_feats[:, 6] = np.clip(time_feats[:, 6], 0, 1)
+
+        # Clip to safe ranges to prevent embedding index errors
+        time_feats[:, 0] = np.clip(time_feats[:, 0], 0, 100)  # year: 0-100
+        time_feats[:, 1] = np.clip(time_feats[:, 1], 0, 12)   # month: 0-12
+        time_feats[:, 2] = np.clip(time_feats[:, 2], 0, 31)   # day: 0-31
+        time_feats[:, 3] = np.clip(time_feats[:, 3], 0, 23)   # hour: 0-23
+        time_feats[:, 4] = np.clip(time_feats[:, 4], 0, 59)   # minute: 0-59
+        time_feats[:, 5] = np.clip(time_feats[:, 5], 0, 6)    # weekday: 0-6
+        time_feats[:, 6] = np.clip(time_feats[:, 6], 0, 1)    # is_weekend: 0-1
+
         return time_feats
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
@@ -553,26 +570,20 @@ class PCVRParquetDataset(IterableDataset):
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- Extract time features ----
-        label_times = None
-        if 'label_time' in self._col_idx:
-            label_times = batch.column(self._col_idx['label_time']).to_numpy().astype(np.int64)
-        timestamp_feats = self._extract_time_features(timestamps)
-        if label_times is not None:
-            label_time_feats = self._extract_time_features(label_times)
-            decision_time = np.maximum(label_times - timestamps, 0)
-            decision_time_bucket = np.zeros(B, dtype=np.int64)
-            decision_time_bucket[decision_time > 0] = 1
-            decision_time_bucket[decision_time > 60] = 2
-            decision_time_bucket[decision_time > 300] = 3
-            decision_time_bucket[decision_time > 3600] = 4
-            decision_time_bucket = np.clip(decision_time_bucket, 0, 4)
-            time_features = np.concatenate([timestamp_feats, label_time_feats, decision_time_bucket.reshape(-1, 1)], axis=1)
-        else:
-            time_features = timestamp_feats
+        # Extract time features from timestamp (7 features)
+        # Note: Do NOT use label_time as it causes data leakage
+        time_features = self._extract_time_features(timestamps)
 
         # ---- user_int: write into pre-allocated buffer ----
+        # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
+        # are treated the same as padding. Features with vs==0 have no vocab
+        # information and are forced to 0 on the dataset side so that the
+        # model's 1-slot Embedding (created for vs=0) is never indexed out of
+        # range.
         user_int = self._buf_user_int[:B]
         user_int[:] = 0
+
+        # First, fill original user_int features
         original_offset = 0
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
@@ -594,11 +605,12 @@ class PCVRParquetDataset(IterableDataset):
                 user_int[:, original_offset:original_offset + dim] = padded
                 original_offset += dim
 
-        # Append time features
+        # Then, append time features at the end
         num_time_feats = time_features.shape[1]
         if original_offset + num_time_feats <= user_int.shape[1]:
             user_int[:, original_offset:original_offset + num_time_feats] = time_features
         else:
+            # Buffer too small, need to expand (should not happen if schema is correct)
             logging.warning(f"user_int buffer too small: {user_int.shape[1]} < {original_offset + num_time_feats}")
 
         # ---- item_int ----

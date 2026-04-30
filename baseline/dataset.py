@@ -215,10 +215,9 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- Pre-allocate numpy buffers ----
         B = batch_size
-        # Add space for time features: 15 features (7 timestamp + 7 label_time + 1 decision_time)
-        # or 7 features if label_time is not available
-        self._num_time_features = 15  # Will be adjusted if label_time is missing
-        self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim + self._num_time_features), dtype=np.int64)
+        # Add space for time features: 7 features (year, month, day, hour, minute, weekday, is_weekend)
+        self._num_time_features = 7
+        self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
@@ -287,12 +286,10 @@ class PCVRParquetDataset(IterableDataset):
 
         # Add time features to schema (will be appended at the end)
         # Time feature vocab sizes: year(101), month(13), day(32), hour(24), minute(60), weekday(7), is_weekend(2)
-        # If label_time exists: add another 7 features + 1 decision_time(5)
-        time_feature_vocab_sizes = [101, 13, 32, 24, 60, 7, 2]  # timestamp features
-        time_feature_vocab_sizes_full = time_feature_vocab_sizes + [101, 13, 32, 24, 60, 7, 2, 5]  # + label_time + decision_time
+        # Only use timestamp features (7 total) - do NOT use label_time to avoid data leakage
+        time_feature_vocab_sizes = [101, 13, 32, 24, 60, 7, 2]
 
-        # We'll add the full set; if label_time is missing, we'll only use the first 7
-        for i, vs in enumerate(time_feature_vocab_sizes_full):
+        for i, vs in enumerate(time_feature_vocab_sizes):
             fid = 10000 + i  # Use high fid to avoid collision
             self.user_int_schema.add(fid, 1)
             self.user_int_vocab_sizes.append(vs)
@@ -573,36 +570,9 @@ class PCVRParquetDataset(IterableDataset):
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- Extract time features ----
-        # Get label_time if available
-        label_times = None
-        if 'label_time' in self._col_idx:
-            label_times = batch.column(self._col_idx['label_time']).to_numpy().astype(np.int64)
-
         # Extract time features from timestamp (7 features)
-        timestamp_feats = self._extract_time_features(timestamps)
-
-        # Extract time features from label_time (7 features) + decision time (1 feature)
-        if label_times is not None:
-            label_time_feats = self._extract_time_features(label_times)
-            # Decision time: label_time - timestamp (in seconds), bucketed
-            decision_time = np.maximum(label_times - timestamps, 0)
-            # Bucket decision time: 0-60s->1, 60-300s->2, 300-3600s->3, >3600s->4
-            decision_time_bucket = np.zeros(B, dtype=np.int64)
-            decision_time_bucket[decision_time > 0] = 1
-            decision_time_bucket[decision_time > 60] = 2
-            decision_time_bucket[decision_time > 300] = 3
-            decision_time_bucket[decision_time > 3600] = 4
-            decision_time_bucket = np.clip(decision_time_bucket, 0, 4)
-
-            # Combine: 7 (timestamp) + 7 (label_time) + 1 (decision_time) = 15 features
-            time_features = np.concatenate([
-                timestamp_feats,
-                label_time_feats,
-                decision_time_bucket.reshape(-1, 1)
-            ], axis=1)
-        else:
-            # Only timestamp features: 7 features
-            time_features = timestamp_feats
+        # Note: Do NOT use label_time as it causes data leakage
+        time_features = self._extract_time_features(timestamps)
 
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
