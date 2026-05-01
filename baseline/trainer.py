@@ -47,7 +47,7 @@ class PCVRHyFormerRankingTrainer:
         save_dir: str,
         early_stopping: EarlyStopping,
         loss_type: str = 'bce',
-        focal_alpha: float = 0.1,
+        focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
@@ -60,8 +60,8 @@ class PCVRHyFormerRankingTrainer:
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
         use_infonce: bool = False,
-        infonce_weight: float = 0.5,
-        infonce_temperature: float = 0.07,
+        infonce_weight: float = 0.3,
+        infonce_temperature: float = 0.1,
         use_amp: bool = False,
     ) -> None:
         self.model: nn.Module = model

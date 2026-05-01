@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
-    parser.add_argument('--focal_alpha', type=float, default=0.1,
+    parser.add_argument('--focal_alpha', type=float, default=0.25,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
@@ -197,9 +197,9 @@ def parse_args() -> argparse.Namespace:
     # InfoNCE loss parameters
     parser.add_argument('--use_infonce', action='store_true', default=False,
                         help='Enable InfoNCE contrastive loss with in-batch negatives')
-    parser.add_argument('--infonce_weight', type=float, default=0.5,
+    parser.add_argument('--infonce_weight', type=float, default=0.3,
                         help='Weight for InfoNCE loss in hybrid loss (effective only when --use_infonce)')
-    parser.add_argument('--infonce_temperature', type=float, default=0.07,
+    parser.add_argument('--infonce_temperature', type=float, default=0.1,
                         help='Temperature parameter for InfoNCE loss (effective only when --use_infonce)')
 
     # AMP parameters

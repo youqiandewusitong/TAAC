@@ -70,7 +70,7 @@ class HybridLoss(nn.Module):
     def __init__(
         self,
         bce_weight: float = 1.0,
-        infonce_weight: float = 0.5,
+        infonce_weight: float = 0.3,
         use_focal: bool = False,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
